@@ -1,4 +1,4 @@
-# 베스핀 AWS 첫 프로젝트 — Ansible (ELK 8.15.5 기준)
+# 첫 프로젝트 — Ansible (ELK 8.15.5 기준)
 
 ## Topology (고정)
 - ES 192.168.1.50
