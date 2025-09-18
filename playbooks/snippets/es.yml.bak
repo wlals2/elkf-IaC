@@ -1,0 +1,175 @@
+---
+- name: Install & configure Elasticsearch (dev mode, security OFF)
+  hosts: es
+  gather_facts: true
+  become: true
+
+  vars:
+    es_heap: "4g"   # 필요시 조절
+
+  tasks:
+    # --- APT key/repo -------------------------------------------------------
+    - name: Ensure keyrings dir exists
+      file:
+        path: /usr/share/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Elastic GPG key (ASCII)
+      get_url:
+        url: "{{ elastic_repo_key_url }}"
+        dest: /usr/share/keyrings/elastic-archive-keyring.asc
+        mode: "0644"
+
+    - name: Dearmor → .gpg (for signed-by)
+      command: >
+        gpg --dearmor
+        -o /usr/share/keyrings/elastic-archive-keyring.gpg
+        /usr/share/keyrings/elastic-archive-keyring.asc
+      args:
+        creates: /usr/share/keyrings/elastic-archive-keyring.gpg
+
+    - name: Write Elastic apt source
+      copy:
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+        mode: "0644"
+        content: "{{ elastic_repo_line }}\n"
+
+    - name: Apt update
+      apt:
+        update_cache: true
+
+    - name: Install Elasticsearch {{ elastic_version }}
+      apt:
+        name: "elasticsearch={{ elastic_version }}"
+        state: present
+
+    # --- Kernel param / dirs / ownership -----------------------------------
+    - name: Ensure vm.max_map_count runtime
+      sysctl:
+        name: vm.max_map_count
+        value: "262144"
+        state: present
+        reload: yes
+
+    - name: Persist vm.max_map_count
+      copy:
+        dest: /etc/sysctl.d/99-elasticsearch.conf
+        mode: "0644"
+        content: "vm.max_map_count=262144\n"
+      notify: Reload sysctl
+
+    - name: Ensure data dir ownership
+      file:
+        path: /var/lib/elasticsearch
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: "0750"
+
+    - name: Ensure logs dir ownership
+      file:
+        path: /var/log/elasticsearch
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: "0750"
+
+    # --- Clean any lingering SSL secrets in keystore ------------------------
+    - name: Remove SSL-related secure settings from keystore if present
+      command: /usr/share/elasticsearch/bin/elasticsearch-keystore remove {{ item }}
+      register: rmks
+      changed_when: "'Removed' in (rmks.stdout | default(''))"
+      failed_when: false
+      loop:
+        - xpack.security.transport.ssl.keystore.secure_password
+        - xpack.security.transport.ssl.truststore.secure_password
+        - xpack.security.http.ssl.keystore.secure_password
+        - xpack.security.http.ssl.truststore.secure_password
+
+    # --- Config files (minimal dev; security/SSL fully OFF) -----------------
+    - name: Write elasticsearch.yml (overwrite with minimal dev config)
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        mode: "0644"
+        content: |
+          cluster.name: lab-cluster
+          node.name: es1
+
+          path.data: /var/lib/elasticsearch
+          path.logs: /var/log/elasticsearch
+
+          network.host: 0.0.0.0
+          http.port: 9200
+
+          discovery.type: single-node
+
+          # lab: security & SSL fully disabled
+          xpack.security.enabled: false
+          xpack.security.transport.ssl.enabled: false
+          xpack.security.http.ssl.enabled: false
+      notify: Restart elasticsearch
+
+    - name: Set JVM heap
+      copy:
+        dest: /etc/elasticsearch/jvm.options.d/heap.options
+        mode: "0644"
+        content: |
+          -Xms{{ es_heap }}
+          -Xmx{{ es_heap }}
+      notify: Restart elasticsearch
+
+    # --- systemd limits override (optional but safe) ------------------------
+    - name: Create systemd drop-in dir
+      file:
+        path: /etc/systemd/system/elasticsearch.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Write systemd override (nofile/memlock)
+      copy:
+        dest: /etc/systemd/system/elasticsearch.service.d/override.conf
+        mode: "0644"
+        content: |
+          [Service]
+          LimitNOFILE=65535
+          LimitMEMLOCK=infinity
+      notify:
+        - Daemon reload
+        - Restart elasticsearch
+
+    # --- Start & verify -----------------------------------------------------
+    - name: Enable & start elasticsearch
+      systemd:
+        name: elasticsearch
+        enabled: true
+        state: started
+        daemon_reload: yes
+
+    - name: Wait for TCP 9200
+      wait_for:
+        host: 127.0.0.1
+        port: 9200
+        delay: 2
+        timeout: 60
+
+    - name: HTTP ping
+      uri:
+        url: http://127.0.0.1:9200
+        return_content: true
+      register: es_root
+
+    - name: Show ES root response
+      debug:
+        var: es_root.json
+
+  handlers:
+    - name: Reload sysctl
+      command: sysctl --system
+    - name: Daemon reload
+      command: systemctl daemon-reload
+    - name: Restart elasticsearch
+      service:
+        name: elasticsearch
+        state: restarted
+

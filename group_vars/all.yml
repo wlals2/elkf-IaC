@@ -1,0 +1,16 @@
+# Elastic 리포지토리/버전
+elastic_version: "8.15.5"
+elastic_repo_key_url: "https://artifacts.elastic.co/GPG-KEY-elasticsearch"
+elastic_repo_line: 'deb [signed-by=/usr/share/keyrings/elastic-archive-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main'
+
+# 토폴로지(네 프로젝트 고정)
+es_url: "http://192.168.1.50:9200"
+ls_host: "192.168.1.51"
+beats_listen_host: "0.0.0.0"
+beats_listen_port: 5044
+
+# 출력 인덱스 접두사 (Kibana Data View는 webapp2-*)
+ls_index_prefix: "webapp2"
+
+# WEB 로그 경로(웹 노드)
+web_logs_glob: "/home/web/web/logging-control/logs/*.log"

@@ -1,0 +1,65 @@
+---
+- name: Install Kibana on KB
+  hosts: kb
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Ensure keyrings dir exists
+      file:
+        path: /usr/share/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Elastic GPG key (ASCII)
+      get_url:
+        url: "{{ elastic_repo_key_url }}"
+        dest: /usr/share/keyrings/elastic-archive-keyring.asc
+        mode: "0644"
+
+    - name: Dearmor → .gpg
+      command: >
+        gpg --dearmor
+        -o /usr/share/keyrings/elastic-archive-keyring.gpg
+        /usr/share/keyrings/elastic-archive-keyring.asc
+      args:
+        creates: /usr/share/keyrings/elastic-archive-keyring.gpg
+
+    - name: Write Elastic apt source
+      copy:
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+        mode: "0644"
+        content: "{{ elastic_repo_line }}\n"
+
+    - name: Apt update
+      apt:
+        update_cache: true
+
+    - name: Install Kibana {{ elastic_version }}
+      apt:
+        name: "kibana={{ elastic_version }}"
+        state: present
+
+    - name: Configure kibana.yml (lab)
+      copy:
+        dest: /etc/kibana/kibana.yml
+        mode: "0644"
+        content: |
+          server.host: "0.0.0.0"
+          server.port: 5601
+          elasticsearch.hosts: ["http://192.168.1.50:9200"]
+      notify: Restart kibana
+
+    - name: Enable & start Kibana
+      systemd:
+        name: kibana
+        enabled: true
+        state: started
+        daemon_reload: yes
+
+  handlers:
+    - name: Restart kibana
+      service:
+        name: kibana
+        state: restarted
+

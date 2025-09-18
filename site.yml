@@ -1,0 +1,7 @@
+---
+- import_playbook: playbooks/bootstrap.yml
+- import_playbook: playbooks/es.yml
+- import_playbook: playbooks/ls.yml
+- import_playbook: playbooks/kb.yml
+- import_playbook: playbooks/filebeat.yml
+

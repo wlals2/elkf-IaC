@@ -1,0 +1,31 @@
+---
+# Play 1) 컨트롤 노드(ES) 로컬에서 키 생성(없으면)
+- name: Ensure controller has an SSH keypair
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check if SSH key exists
+      stat:
+        path: "{{ lookup('env','HOME') + '/.ssh/id_ed25519' }}"
+      register: keypair
+
+    - name: Generate SSH keypair (ed25519, no passphrase) if missing
+      command: >
+        ssh-keygen -t ed25519 -N '' -f {{ lookup('env','HOME') + '/.ssh/id_ed25519' }}
+      when: not keypair.stat.exists
+
+# Play 2) 모든 원격 노드(eth1 고정 IP)로 공개키 배포
+- name: Install controller public key to each host user
+  hosts: all
+  gather_facts: false
+  become: false
+  vars:
+    controller_pubkey_path: "{{ lookup('env','HOME') + '/.ssh/id_ed25519.pub' }}"
+  tasks:
+    - name: Ensure controller public key is authorized for this host's login user
+      authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ lookup('file', controller_pubkey_path) }}"
+

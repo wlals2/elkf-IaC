@@ -1,0 +1,321 @@
+---
+# Logstash: pin 8.15.5 (fail → latest), 커스텀 파서 설치/구동
+- name: Install & configure Logstash on LS
+  hosts: ls
+  become: true
+  gather_facts: true
+
+  vars:
+    # === 네트워크/출력 대상 ===
+    es_url: "http://192.168.1.50:9200"
+    ls_pipeline_dir: /etc/logstash/conf.d
+    beats_listen_host: "0.0.0.0"   # IPv4 강제 바인딩
+    beats_listen_port: 5044
+    ls_index_prefix: "webapp2"     # 결과 인덱스 프리픽스
+
+  tasks:
+    # --- Elastic APT repo (메모리의 정책 준수: signed-by + dearmor) --------
+    - name: Ensure keyrings dir exists
+      file:
+        path: /usr/share/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Elastic GPG key (ASCII)
+      get_url:
+        url: "{{ elastic_repo_key_url }}"
+        dest: /usr/share/keyrings/elastic-archive-keyring.asc
+        mode: "0644"
+
+    - name: Dearmor → .gpg (for signed-by)
+      command: >
+        gpg --dearmor
+        -o /usr/share/keyrings/elastic-archive-keyring.gpg
+        /usr/share/keyrings/elastic-archive-keyring.asc
+      args:
+        creates: /usr/share/keyrings/elastic-archive-keyring.gpg
+
+    - name: Write Elastic apt source
+      copy:
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+        mode: "0644"
+        content: "{{ elastic_repo_line }}\n"
+
+    - name: Apt update
+      apt:
+        update_cache: true
+
+    # --- Install: try pin, fallback to latest -------------------------------
+    - block:
+        - name: Try pinned Logstash {{ elastic_version }}
+          apt:
+            name: "logstash={{ elastic_version }}"
+            state: present
+      rescue:
+        - name: Install Logstash latest (fallback)
+          apt:
+            name: logstash
+            state: present
+
+    # --- 최소 logstash.yml (xpack 모니터링 off, IPv4 API 열기) -------------
+    - name: Configure /etc/logstash/logstash.yml (minimal)
+      copy:
+        dest: /etc/logstash/logstash.yml
+        mode: "0644"
+        content: |
+          http.host: "0.0.0.0"
+          xpack.monitoring.enabled: false
+          pipeline.ordered: auto
+          path.data: /var/lib/logstash
+          path.logs: /var/log/logstash
+      notify: Restart logstash
+
+    # --- Pipelines ----------------------------------------------------------
+    - name: Ensure pipeline dir exists
+      file:
+        path: "{{ ls_pipeline_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: 01-input-beats.conf (IPv4 0.0.0.0:{{ beats_listen_port }})
+      copy:
+        dest: "{{ ls_pipeline_dir }}/01-input-beats.conf"
+        mode: "0644"
+        content: |
+          input {
+            beats {
+              host => "{{ beats_listen_host }}"
+              port => {{ beats_listen_port }}
+            }
+          }
+      notify: Restart logstash
+
+    - name: 20-parse-weblogs.conf (Dissect→Grok→Ruby, 후처리)
+      copy:
+        dest: "{{ ls_pipeline_dir }}/20-parse-weblogs.conf"
+        mode: "0644"
+        content: |
+          filter {
+            ####################################################################
+            # 탭 기반 파싱을 1순위로: o(주문)=15컬럼, 그 외=14컬럼
+            ####################################################################
+            if [message] =~ /^\s*o\t/ {
+              dissect {
+                mapping => {
+                  "message" => "%{event_code}\t%{event_created}\t%{[url][path]}\t%{[http][request][method]}\t%{col5}\t%{col6}\t%{col7}\t%{col8}\t%{col9}\t%{col10}\t%{[order][amount]}\t%{[client][ip]}\t%{[user_agent][original]}\t%{referrer_raw}\t%{status_code}"
+                }
+                tag_on_failure => ["_dissect_o_tab15_fail"]
+              }
+              if [order][amount] { mutate { add_tag => ["_amount_from_dissect15"] } }
+            } else {
+              dissect {
+                mapping => {
+                  "message" => "%{event_code}\t%{event_created}\t%{[url][path]}\t%{[http][request][method]}\t%{col5}\t%{col6}\t%{col7}\t%{col8}\t%{col9}\t%{col10}\t%{[client][ip]}\t%{[user_agent][original]}\t%{referrer_raw}\t%{status_code}"
+                }
+                tag_on_failure => ["_dissect_tab14_fail"]
+              }
+            }
+
+            ####################################################################
+            # 폴백: DISECT 실패/혼합 공백 라인에서 amount까지 GROK로 시도
+            ####################################################################
+            if ("_dissect_o_tab15_fail" in [tags]) or ("_dissect_tab14_fail" in [tags]) {
+              mutate { remove_tag => ["_dissect_o_tab15_fail","_dissect_tab14_fail"] }
+              grok {
+                match => {
+                  "message" => [
+                    '^(?<event_code>\w)\s+(?<event_created>\S+)\s+(?<url_path>\S+)\s+(?<http_method>\w+)\s+(?<col5>\S+)\s+(?<col6>\S+)\s+(?<col7>\S+)\s+(?<col8>\S+)\s+(?<col9>\S+)\s+(?<col10>\S+)\s+(?<order_amount>\d+)\s+(?<client_ip>\S+)\s+(?<ua>.+?)\s+(?<referrer_raw>\S+)\s+(?<status_code>\d{3})$',
+                    '^(?<event_code>\w)\s+(?<event_created>\S+)\s+(?<url_path>\S+)\s+(?<http_method>\w+)\s+(?<col5>\S+)\s+(?<col6>\S+)\s+(?<col7>\S+)\s+(?<col8>\S+)\s+(?<col9>\S+)\s+(?<col10>\S+)\s+(?<order_amount>\d+)\s+(?<client_ip>\S+)\s+(?<ua>.+?)\s+(?<referrer_raw>\S+)$'
+                  ]
+                }
+                tag_on_failure => ["_grok_fail"]
+              }
+              if [order_amount] {
+                mutate {
+                  add_field => { "[order][amount]" => "%{order_amount}" }
+                  remove_field => ["order_amount"]
+                  add_tag => ["_amount_from_grok"]
+                }
+              }
+              if [event_code] {
+                mutate {
+                  rename => {
+                    "url_path"    => "[url][path]"
+                    "http_method" => "[http][request][method]"
+                    "client_ip"   => "[client][ip]"
+                    "ua"          => "[user_agent][original]"
+                  }
+                }
+              }
+            }
+
+            ####################################################################
+            # 최후 폴백: message에서 탭 11번째(0부터 10) 강제 추출
+            ####################################################################
+            if [event_code] == "o" and ![order][amount] and [message] {
+              ruby {
+                code => '
+                  m = event.get("message")
+                  if m
+                    arr = m.split("\t", -1)
+                    if arr.length >= 15
+                      event.set("[order][amount]", arr[10])
+                      event.tag("_amount_from_ruby")
+                    end
+                  end
+                '
+              }
+            }
+
+            ####################################################################
+            # 공통 후처리
+            ####################################################################
+            date {
+              match  => ["event_created","ISO8601","yyyy-MM-dd'T'HH:mm:ss.SSSSSS","yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS","yyyy-MM-dd'T'HH:mm:ssZ"]
+              target => "@timestamp"
+            }
+            mutate { remove_field => ["event_created"] }
+
+            useragent {
+              source => "[user_agent][original]"
+              target => "user_agent"
+            }
+
+            mutate {
+              gsub => [
+                "col5","^(?:-|null)$","",
+                "col6","^(?:-|null)$","",
+                "col7","^(?:-|null)$","",
+                "col8","^(?:-|null)$","",
+                "col9","^(?:-|null)$","",
+                "col10","^(?:-|null)$","",
+                "referrer_raw","^(?:-|null)$","",
+                "status_code","^(?:-|null)$",""
+              ]
+              convert => {
+                "col5"        => "integer"
+                "col7"        => "integer"
+                "col8"        => "integer"
+                "col10"       => "integer"
+                "status_code" => "integer"
+                "[order][amount]" => "integer"
+              }
+            }
+
+            if [referrer_raw] and [referrer_raw] != "" {
+              mutate { add_field => { "[http][request][referrer]" => "%{referrer_raw}" } }
+            }
+
+            if [col5]  == "" { mutate { remove_field => ["col5"] } }
+            if [col6]  == "" { mutate { remove_field => ["col6"] } }
+            if [col7]  == "" { mutate { remove_field => ["col7"] } }
+            if [col8]  == "" { mutate { remove_field => ["col8"] } }
+            if [col9]  == "" { mutate { remove_field => ["col9"] } }
+            if [col10] == "" { mutate { remove_field => ["col10"] } }
+            if [referrer_raw] == "" { mutate { remove_field => ["referrer_raw"] } }
+
+            mutate { lowercase => ["event_code"] }
+            translate {
+              source   => "event_code"
+              target   => "[event][category]"
+              override => true
+              dictionary => { "c" => "cart" "o" => "order" "l" => "list" "v" => "view" }
+              fallback => "other"
+            }
+
+            if [status_code] {
+              mutate { add_field => { "[http][response][status_code]" => "%{status_code}" } }
+              mutate { convert   => { "[http][response][status_code]" => "integer" } }
+            }
+
+            # (마지막) message 정리
+            mutate { remove_field => ["message"] }
+          }
+
+          # --- (선택) S3 경량 도큐먼트용 export 필드 구성 (S3 사용 안함이라도 무해) ---
+          filter {
+            mutate {
+              add_field => {
+                "[export][ts]"        => "%{@timestamp}"
+                "[export][code]"      => "%{[event_code]}"
+                "[export][category]"  => "%{[event][category]}"
+                "[export][url_path]"  => "%{[url][path]}"
+                "[export][method]"    => "%{[http][request][method]}"
+                "[export][client_ip]" => "%{[client][ip]}"
+                "[export][status]"    => "%{[http][response][status_code]}"
+                "[export][referrer]"  => "%{[http][request][referrer]}"
+                "[export][ua_name]"   => "%{[user_agent][name]}"
+                "[export][app]"       => "%{[app]}"
+                "[export][amount]"    => "%{[order][amount]}"
+              }
+            }
+            mutate {
+              gsub => [
+                "[export][referrer]","^(?:null|-)?$","",
+                "[export][code]","^(?:null|-)?$","",
+                "[export][category]","^(?:null|-)?$","",
+                "[export][url_path]","^(?:null|-)?$","",
+                "[export][method]","^(?:null|-)?$","",
+                "[export][client_ip]","^(?:null|-)?$","",
+                "[export][ua_name]","^(?:null|-)?$","",
+                "[export][app]","^(?:null|-)?$",""
+              ]
+              convert => { "[export][status]" => "integer" }
+            }
+          }
+      notify: Restart logstash
+
+    - name: 30-output-es.conf (to ES, index={{ ls_index_prefix }}-%{+YYYY.MM.dd})
+      copy:
+        dest: "{{ ls_pipeline_dir }}/30-output-es.conf"
+        mode: "0644"
+        content: |
+          output {
+            elasticsearch {
+              hosts => ["{{ es_url }}"]
+              index => "{{ ls_index_prefix }}-%{+YYYY.MM.dd}"
+            }
+            stdout { codec => rubydebug { metadata => false } }
+          }
+      notify: Restart logstash
+
+    # --- Config test (syntax check) -----------------------------------------
+    - name: Test pipeline syntax
+      command: /usr/share/logstash/bin/logstash --path.settings /etc/logstash -t
+      register: ls_test
+      changed_when: false
+      failed_when: "ls_test.rc != 0"
+
+    # --- Service ------------------------------------------------------------
+    - name: Enable & start Logstash
+      systemd:
+        name: logstash
+        enabled: true
+        state: started
+        daemon_reload: yes
+
+    # --- Health checks ------------------------------------------------------
+    - name: Wait for beats port {{ beats_listen_port }}
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ beats_listen_port }}"
+        delay: 2
+        timeout: 60
+
+    - name: Logstash node API ping (localhost:9600)
+      uri:
+        url: http://127.0.0.1:9600/_node/pipelines?pretty
+        return_content: true
+      register: ls_api
+      failed_when: "ls_api.status | default(0) < 200 or ls_api.status | default(0) >= 300"
+
+    - name: Show running pipelines
+      debug:
+        msg: "{{ (ls_api.json.pipelines | default({})).keys() | list }}"
+
+  handlers:
+    - name: Restart logstash
+      service:
+        name: logstash
+        state: restarted
+

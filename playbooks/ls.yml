@@ -1,0 +1,258 @@
+---
+- name: Manage Logstash pipelines (webapp2)
+  hosts: ls
+  become: true
+
+  vars:
+    ls_pipeline_dir: "/etc/logstash/conf.d"
+    ls_settings_dir: "/etc/logstash"
+    beats_listen_host: "0.0.0.0"
+    beats_listen_port: 5044
+    es_url: "http://192.168.1.50:9200"
+    ls_index_prefix: "webapp2"
+
+  pre_tasks:
+    - name: Ensure Logstash package installed
+      apt:
+        name: logstash
+        state: present
+        update_cache: yes
+
+    - name: Stop/disable legacy tar-based service if exists
+      service:
+        name: logstash-tar
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    - name: Ensure settings dir exists with ownership
+      file:
+        path: "{{ ls_settings_dir }}"
+        state: directory
+        owner: logstash
+        group: logstash
+        mode: "0755"
+
+  tasks:
+    # ── logstash.yml 정리: alias(http.host) 제거 + api.http.host 지정 ──
+    - name: Remove deprecated http.host alias from logstash.yml if present
+      lineinfile:
+        path: "{{ ls_settings_dir }}/logstash.yml"
+        regexp: '^\s*#?\s*http\.host:'
+        state: absent
+      notify: "Validate & restart"
+
+    - name: Set api.http.host to 0.0.0.0
+      lineinfile:
+        path: "{{ ls_settings_dir }}/logstash.yml"
+        regexp: '^\s*#?\s*api\.http\.host:'
+        line: 'api.http.host: "0.0.0.0"'
+        create: yes
+        owner: logstash
+        group: logstash
+        mode: "0644"
+      notify: "Validate & restart"
+
+    # (선택) 경고 억제용: superuser 경고가 거슬리면 주석 해제
+    # - name: Allow superuser warning acknowledge (optional)
+    #   lineinfile:
+    #     path: "{{ ls_settings_dir }}/logstash.yml"
+    #     regexp: '^\s*#?\s*allow_superuser:'
+    #     line: 'allow_superuser: true'
+    #     create: yes
+    #     owner: logstash
+    #     group: logstash
+    #     mode: "0644"
+    #   notify: "Validate & restart"
+
+    # ── conf.d 초기화(이 플레이북이 conf 전체 관리) ──
+    - name: Purge pipeline dir
+      file:
+        path: "{{ ls_pipeline_dir }}"
+        state: absent
+
+    - name: Recreate pipeline dir with ownership
+      file:
+        path: "{{ ls_pipeline_dir }}"
+        state: directory
+        owner: logstash
+        group: logstash
+        mode: "0755"
+
+    # ── 01-input (beats) ──
+    - name: Install 01-input-beats.conf
+      copy:
+        dest: "{{ ls_pipeline_dir }}/01-input-beats.conf"
+        owner: logstash
+        group: logstash
+        mode: "0644"
+        content: |
+          input {
+            beats {
+              host => "{{ beats_listen_host }}"
+              port => {{ beats_listen_port }}
+            }
+          }
+      notify: "Validate & restart"
+
+    # ── 20-parse (탭/스페이스 혼용 안전, 15→14 fallback) ──
+    - name: Install 20-parse-weblogs.conf
+      copy:
+        dest: "{{ ls_pipeline_dir }}/20-parse-weblogs.conf"
+        owner: logstash
+        group: logstash
+        mode: "0644"
+        content: |
+          filter {
+            if ![message] and [event][original] {
+              mutate { add_field => { "message" => "%{[event][original]}" } }
+            }
+            mutate { gsub => ["message", "\r$", ""] }
+            if ![app] and [fields][app] { mutate { add_field => { "app" => "%{[fields][app]}" } } }
+
+            grok {
+              match => {
+                "message" => [
+                  '^(?<event_code>\w)(?:\t+|\s+)(?<event_created>\S+)(?:\t+|\s+)(?<url_path>\S+)(?:\t+|\s+)(?<http_method>\S+)(?:\t+|\s+)(?<order_id>\d+)(?:\t+|\s+)(?<order_tx_id>\S+)(?:\t+|\s+)(?<order_item_id>\d+)(?:\t+|\s+)(?<order_quantity>\d+)(?:\t+|\s+)(?<col9>\S+)(?:\t+|\s+)(?<col10>\S+)(?:\t+|\s+)(?<order_amount>\d+)(?:\t+|\s+)(?<client_ip>\S+)(?:\t+|\s+)(?<ua>.+?)(?:\t+|\s+)(?<referrer_raw>\S+)(?:\t+|\s+)(?<status_code>\d{3})$',
+                  '^(?<event_code>\w)(?:\t+|\s+)(?<event_created>\S+)(?:\t+|\s+)(?<url_path>\S+)(?:\t+|\s+)(?<http_method>\S+)(?:\t+|\s+)(?<order_id>\d+)(?:\t+|\s+)(?<order_tx_id>\S+)(?:\t+|\s+)(?<order_item_id>\d+)(?:\t+|\s+)(?<order_quantity>\d+)(?:\t+|\s+)(?<col9>\S+)(?:\t+|\s+)(?<col10>\S+)(?:\t+|\s+)(?<client_ip>\S+)(?:\t+|\s+)(?<ua>.+?)(?:\t+|\s+)(?<referrer_raw>\S+)(?:\t+|\s+)(?<status_code>\d{3})$'
+                ]
+              }
+              tag_on_failure => ["_grok_fail"]
+            }
+
+            mutate {
+              rename => {
+                "url_path"       => "[url][path]"
+                "http_method"    => "[http][request][method]"
+                "client_ip"      => "[client][ip]"
+                "ua"             => "[user_agent][original]"
+                "order_id"       => "[order][id]"
+                "order_tx_id"    => "[order][tx_id]"
+                "order_item_id"  => "[order][item_id]"
+                "order_quantity" => "[order][quantity]"
+                "order_amount"   => "[order][amount]"
+              }
+              gsub => [
+                "referrer_raw","^(?:-|null)$","",
+                "col9","^(?:-|null)$","",
+                "col10","^(?:-|null)$",""
+              ]
+              convert => {
+                "[order][id]"       => "integer"
+                "[order][item_id]"  => "integer"
+                "[order][quantity]" => "integer"
+                "[order][amount]"   => "integer"
+                "status_code"       => "integer"
+              }
+            }
+
+            if [referrer_raw] and [referrer_raw] != "" {
+              mutate { add_field => { "[http][request][referrer]" => "%{referrer_raw}" } }
+            }
+
+            date {
+              match  => ["event_created","ISO8601","yyyy-MM-dd'T'HH:mm:ss.SSSSSS","yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS","yyyy-MM-dd'T'HH:mm:ssZ"]
+              target => "@timestamp"
+            }
+            mutate { remove_field => ["event_created"] }
+
+            useragent { source => "[user_agent][original]" target => "user_agent" }
+
+            mutate { lowercase => ["event_code"] }
+            translate {
+              source   => "event_code"
+              target   => "[event][category]"
+              override => true
+              dictionary => { "c" => "cart" "o" => "order" "l" => "list" "v" => "view" }
+              fallback => "other"
+            }
+
+            if [status_code] {
+              mutate { add_field => { "[http][response][status_code]" => "%{status_code}" } }
+              mutate { convert   => { "[http][response][status_code]" => "integer" } }
+            }
+
+            if [order][amount] { mutate { add_tag => ["parsed_o_15"] } }
+            else               { mutate { add_tag => ["parsed_x_14"] } }
+
+            mutate { remove_field => ["message","referrer_raw","col9","col10","status_code"] }
+          }
+      notify: "Validate & restart"
+
+    # ── 30-output (ES) ──
+    - name: Install 30-output-es.conf
+      copy:
+        dest: "{{ ls_pipeline_dir }}/30-output-es.conf"
+        owner: logstash
+        group: logstash
+        mode: "0644"
+        content: |
+          output {
+            elasticsearch {
+              hosts => ["{{ es_url }}"]
+              index => "{{ ls_index_prefix }}-%{+YYYY.MM.dd}"
+            }
+            # stdout { codec => rubydebug { metadata => false } }
+          }
+      notify: "Validate & restart"
+
+    # ── pipelines.yml -> conf.d/*.conf ──
+    - name: Force /etc/logstash/pipelines.yml -> conf.d
+      copy:
+        dest: "{{ ls_settings_dir }}/pipelines.yml"
+        owner: logstash
+        group: logstash
+        mode: "0644"
+        content: |
+          - pipeline.id: main
+            path.config: "/etc/logstash/conf.d/*.conf"
+      notify: "Validate & restart"
+
+  handlers:
+    - name: Validate config syntax
+      listen: "Validate & restart"
+      command: /usr/share/logstash/bin/logstash --path.settings {{ ls_settings_dir }} -t
+      register: ls_test
+      changed_when: false
+
+    - name: Show validation output
+      listen: "Validate & restart"
+      debug:
+        var: ls_test.stdout_lines
+
+    - name: Restart Logstash service
+      listen: "Validate & restart"
+      systemd:
+        name: logstash
+        enabled: true
+        state: restarted
+        daemon_reload: yes
+
+    - name: Wait for beats port
+      listen: "Validate & restart"
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ beats_listen_port }}"
+        delay: 2
+        timeout: 60
+      ignore_errors: true
+
+    - name: Wait for Node API 9600
+      listen: "Validate & restart"
+      wait_for:
+        host: 127.0.0.1
+        port: 9600
+        timeout: 30
+
+    - name: Print loaded pipeline hash (sanity)
+      listen: "Validate & restart"
+      uri:
+        url: "http://127.0.0.1:9600/_node/pipelines"
+        return_content: yes
+      register: node_pipes
+
+    - name: Show pipeline hash
+      listen: "Validate & restart"
+      debug:
+        var: node_pipes.json.pipelines.main.hash
+

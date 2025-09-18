@@ -1,0 +1,186 @@
+- name: Deploy Spring Boot web app as a systemd service (WEB 192.168.1.53)
+  hosts: web
+  become: true
+
+  vars:
+    service_unit: "{{ app_name }}.service"
+    java_home_guess: "/usr/lib/jvm/java-17-openjdk-amd64"
+
+  pre_tasks:
+    - name: Ensure base directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: web
+        group: web
+        mode: '0755'
+      loop:
+        - "{{ app_base_dir }}"
+        - "{{ app_dir }}"
+        - "{{ app_logs_dir }}"
+
+  tasks:
+    - name: Install OpenJDK (fix JAVA_HOME not set)
+      apt:
+        name: "{{ java_pkg }}"
+        state: present
+        update_cache: true
+
+    - name: Ensure git is installed
+      apt:
+        name: git
+        state: present
+
+    - name: Clone or update git repo
+      become_user: web
+      git:
+        repo: "{{ app_repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ app_branch }}"
+        force: yes
+        update: yes
+
+    - name: Ensure gradlew is executable
+      file:
+        path: "{{ app_dir }}/gradlew"
+        mode: '0755'
+        owner: web
+        group: web
+
+    - name: Create systemd unit for {{ app_name }} (bootRun mode)
+      when: run_mode == "bootRun"
+      copy:
+        dest: "/etc/systemd/system/{{ service_unit }}"
+        mode: '0644'
+        content: |
+          [Unit]
+          Description={{ app_name }} (Gradle bootRun)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=web
+          WorkingDirectory={{ app_dir }}
+          Environment=JAVA_HOME={{ java_home_guess }}
+          ExecStart=/usr/bin/bash -lc './gradlew bootRun --no-daemon'
+          Restart=always
+          RestartSec=5
+          StandardOutput=append:{{ app_logs_dir }}/stdout.log
+          StandardError=append:{{ app_logs_dir }}/stderr.log
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - daemon-reload
+        - restart app
+
+    - name: Create systemd unit for {{ app_name }} (bootJar mode)
+      when: run_mode == "bootJar"
+      copy:
+        dest: "/etc/systemd/system/{{ service_unit }}"
+        mode: '0644'
+        content: |
+          [Unit]
+          Description={{ app_name }} (bootJar java -jar)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=web
+          WorkingDirectory={{ app_dir }}
+          Environment=JAVA_HOME={{ java_home_guess }}
+          ExecStart=/usr/bin/bash -lc './gradlew bootJar --no-daemon && exec java -jar $(ls -1 build/libs/*.jar | head -n1)'
+          Restart=always
+          RestartSec=5
+          StandardOutput=append:{{ app_logs_dir }}/stdout.log
+          StandardError=append:{{ app_logs_dir }}/stderr.log
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - daemon-reload
+        - restart app
+
+    - name: Enable service at boot
+      systemd:
+        name: "{{ service_unit }}"
+        enabled: true
+
+    # --- Filebeat 설정 (로그 수집 -> Logstash 192.168.1.51:5044) ---
+    - name: Install Elastic repo prereqs
+      apt:
+        name: ["apt-transport-https", "gnupg"]
+        state: present
+        update_cache: true
+
+    - name: Add Elastic GPG key (dearmored)
+      shell: |
+        set -e
+        wget -qO /tmp/elastic.asc https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        gpg --dearmor -o /usr/share/keyrings/elastic-archive-keyring.gpg /tmp/elastic.asc
+        rm -f /tmp/elastic.asc
+      args:
+        creates: /usr/share/keyrings/elastic-archive-keyring.gpg
+
+    - name: Add Elastic APT repo (8.x)
+      copy:
+        dest: /etc/apt/sources.list.d/elastic-8.x.list
+        content: 'deb [signed-by=/usr/share/keyrings/elastic-archive-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main'
+        mode: '0644'
+
+    - name: Install filebeat
+      apt:
+        name: filebeat
+        state: present
+        update_cache: true
+
+    - name: Configure filebeat inputs and output (to Logstash)
+      copy:
+        dest: /etc/filebeat/filebeat.yml
+        mode: '0644'
+        content: |
+          filebeat.inputs:
+            - type: filestream
+              id: "{{ app_name }}-logs"
+              paths:
+                - "{{ app_logs_dir }}/*.log"
+                - "{{ app_dir }}/logs/*.log"
+              parsers:
+                - multiline:
+                    type: pattern
+                    pattern: '^\d{4}-\d{2}-\d{2}T'
+                    negate: true
+                    match: after
+
+          output.logstash:
+            hosts: ["192.168.1.51:5044"]
+
+          logging.level: info
+          setup.template.enabled: true
+          setup.template.name: "beats"
+          setup.template.pattern: "beats-*"
+      notify:
+        - restart filebeat
+
+    - name: Enable filebeat at boot
+      systemd:
+        name: filebeat
+        enabled: true
+
+  handlers:
+    - name: daemon-reload
+      systemd:
+        daemon_reload: true
+
+    - name: restart app
+      systemd:
+        name: "{{ service_unit }}"
+        state: restarted
+
+    - name: restart filebeat
+      systemd:
+        name: filebeat
+        state: restarted
+

@@ -1,0 +1,69 @@
+---
+- name: Bootstrap all nodes
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    common_packages:
+      - curl
+      - vim
+      - htop
+      - unzip
+      - net-tools
+      - jq
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+
+  tasks:
+    - name: Apt update (with cache)
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install common packages
+      apt:
+        name: "{{ common_packages }}"
+        state: present
+
+    - name: Read current timezone
+      command: timedatectl show -p Timezone --value
+      register: current_tz
+      changed_when: false
+
+    - name: Ensure /etc/timezone matches desired value
+      copy:
+        dest: /etc/timezone
+        content: "{{ system_timezone }}\n"
+        mode: "0644"
+      when: current_tz.stdout != system_timezone
+
+    - name: Apply timezone only if needed
+      command: "timedatectl set-timezone {{ system_timezone }}"
+      when: current_tz.stdout != system_timezone
+      changed_when: current_tz.stdout != system_timezone
+
+    - name: SSH policy (password on, root off)
+      copy:
+        dest: /etc/ssh/sshd_config.d/99-auth.conf
+        mode: "0644"
+        content: |
+          PasswordAuthentication yes
+          PubkeyAuthentication yes
+          PermitRootLogin no
+      notify: Restart SSH
+
+    - name: Sudo NOPASSWD for %sudo (idempotent)
+      copy:
+        dest: /etc/sudoers.d/99-nopasswd
+        mode: "0440"
+        content: "%sudo ALL=(ALL) NOPASSWD:ALL"
+        validate: "visudo -cf %s"
+
+  handlers:
+    - name: Restart SSH
+      service:
+        name: ssh
+        state: restarted
+

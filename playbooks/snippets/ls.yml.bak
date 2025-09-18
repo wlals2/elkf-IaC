@@ -1,0 +1,202 @@
+---
+- name: Install & configure Logstash on LS
+  hosts: ls
+  become: true
+  gather_facts: true
+
+  vars:
+    ls_pipeline_dir: /etc/logstash/conf.d
+
+  tasks:
+    - name: Ensure keyrings dir exists
+      file: { path: /usr/share/keyrings, state: directory, mode: "0755" }
+
+    - name: Download Elastic GPG key
+      get_url: { url: "{{ elastic_repo_key_url }}", dest: /usr/share/keyrings/elastic-archive-keyring.asc, mode: "0644" }
+
+    - name: Dearmor → .gpg
+      command: >
+        gpg --dearmor -o /usr/share/keyrings/elastic-archive-keyring.gpg
+        /usr/share/keyrings/elastic-archive-keyring.asc
+      args: { creates: /usr/share/keyrings/elastic-archive-keyring.gpg }
+
+    - name: Write Elastic apt source
+      copy: { dest: /etc/apt/sources.list.d/elastic-8.x.list, mode: "0644", content: "{{ elastic_repo_line }}\n" }
+
+    - name: Apt update
+      apt: { update_cache: true }
+
+    - block:
+        - name: Try pinned Logstash {{ elastic_version }}
+          apt: { name: "logstash={{ elastic_version }}", state: present }
+      rescue:
+        - name: Install Logstash latest (fallback)
+          apt: { name: logstash, state: present }
+
+    # ---- logstash.yml & pipelines.yml 확정 ----
+    - name: Configure /etc/logstash/logstash.yml (minimal)
+      copy:
+        dest: /etc/logstash/logstash.yml
+        mode: "0644"
+        content: |
+          http.host: "0.0.0.0"
+          xpack.monitoring.enabled: false
+          pipeline.ordered: auto
+          path.data: /var/lib/logstash
+          path.logs: /var/log/logstash
+
+    - name: Force /etc/logstash/pipelines.yml -> conf.d
+      copy:
+        dest: /etc/logstash/pipelines.yml
+        mode: "0644"
+        content: |
+          - pipeline.id: main
+            path.config: "/etc/logstash/conf.d/*.conf"
+
+    - name: Ensure pipeline dir exists
+      file: { path: "{{ ls_pipeline_dir }}", state: directory, mode: "0755" }
+
+    - name: 01-input-beats.conf (IPv4)
+      copy:
+        dest: "{{ ls_pipeline_dir }}/01-input-beats.conf"
+        mode: "0644"
+        content: |
+          input {
+            beats {
+              host => "{{ beats_listen_host }}"
+              port => {{ beats_listen_port }}
+            }
+          }
+
+    # ---- 20-parse-weblogs.conf : CSV(탭) 1순위 + 스페이스 GROK 폴백 ----
+    - name: 20-parse-weblogs.conf (robust)
+      copy:
+        dest: "{{ ls_pipeline_dir }}/20-parse-weblogs.conf"
+        mode: "0644"
+        content: |
+          filter {
+            # 0) message 정규화: event.original을 소스로 고정
+            if [event][original] {
+              mutate { replace => { "message" => "%{[event][original]}" } }
+            }
+            mutate { gsub => ["message", "\r$", ""] }
+
+            # 0-1) app 루트 필드 보정(혹시 fields.* 로 온 경우)
+            if ![app] and [fields][app] {
+              mutate { add_field => { "app" => "%{[fields][app]}" } }
+            }
+
+            # 1) CSV (TAB) 우선 - o=15, 나머지=14
+            if [message] =~ /\t/ and [message] =~ /^\s*o[\t ]/ {
+              csv {
+                separator => "\t"
+                autogenerate_column_names => false
+                columns => ["event_code","event_created","url_path","http_method","col5","col6","col7","col8","col9","col10","order_amount","client_ip","ua","referrer_raw","status_code"]
+                skip_empty_columns => false
+              }
+              mutate { add_field => { "[order][amount]" => "%{order_amount}" } remove_field => ["order_amount"] }
+            } else if [message] =~ /\t/ {
+              csv {
+                separator => "\t"
+                autogenerate_column_names => false
+                columns => ["event_code","event_created","url_path","http_method","col5","col6","col7","col8","col9","col10","client_ip","ua","referrer_raw","status_code"]
+                skip_empty_columns => false
+              }
+            } else {
+              # 2) 폴백: 스페이스 기반 GROK (15/14 토큰 모두 커버)
+              grok {
+                match => {
+                  "message" => [
+                    '^(?<event_code>\w)\s+(?<event_created>\S+)\s+(?<url_path>\S+)\s+(?<http_method>\w+)\s+(?<col5>\S+)\s+(?<col6>\S+)\s+(?<col7>\S+)\s+(?<col8>\S+)\s+(?<col9>\S+)\s+(?<col10>\S+)\s+(?<order_amount>\d+)\s+(?<client_ip>\S+)\s+(?<ua>.+?)\s+(?<referrer_raw>\S+)\s+(?<status_code>\d{3})$',
+                    '^(?<event_code>\w)\s+(?<event_created>\S+)\s+(?<url_path>\S+)\s+(?<http_method>\w+)\s+(?<col5>\S+)\s+(?<col6>\S+)\s+(?<col7>\S+)\s+(?<col8>\S+)\s+(?<col9>\S+)\s+(?<col10>\S+)\s+(?<client_ip>\S+)\s+(?<ua>.+?)\s+(?<referrer_raw>\S+)\s+(?<status_code>\d{3})$'
+                  ]
+                }
+                tag_on_failure => ["_grok_fail"]
+              }
+              if [order_amount] { mutate { add_field => { "[order][amount]" => "%{order_amount}" } remove_field => ["order_amount"] } }
+            }
+
+            # 3) 공통 후처리/정규화
+            mutate {
+              rename => {
+                "url_path"    => "[url][path]"
+                "http_method" => "[http][request][method]"
+                "client_ip"   => "[client][ip]"
+                "ua"          => "[user_agent][original]"
+              }
+              gsub => [
+                "col5","^(?:-|null)$","",
+                "col6","^(?:-|null)$","",
+                "col7","^(?:-|null)$","",
+                "col8","^(?:-|null)$","",
+                "col9","^(?:-|null)$","",
+                "col10","^(?:-|null)$","",
+                "referrer_raw","^(?:-|null)$",""
+              ]
+              convert => {
+                "col5"        => "integer"
+                "col7"        => "integer"
+                "col8"        => "integer"
+                "col10"       => "integer"
+                "status_code" => "integer"
+                "[order][amount]" => "integer"
+              }
+            }
+
+            if [referrer_raw] and [referrer_raw] != "" {
+              mutate { add_field => { "[http][request][referrer]" => "%{referrer_raw}" } }
+            }
+
+            date {
+              match  => ["event_created","ISO8601","yyyy-MM-dd'T'HH:mm:ss.SSSSSS","yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS","yyyy-MM-dd'T'HH:mm:ssZ"]
+              target => "@timestamp"
+            }
+            mutate { remove_field => ["event_created"] }
+
+            useragent { source => "[user_agent][original]" target => "user_agent" }
+
+            mutate { lowercase => ["event_code"] }
+            translate {
+              source   => "event_code"
+              target   => "[event][category]"
+              override => true
+              dictionary => { "c" => "cart" "o" => "order" "l" => "list" "v" => "view" }
+              fallback => "other"
+            }
+
+            if [status_code] {
+              mutate { add_field => { "[http][response][status_code]" => "%{status_code}" } }
+              mutate { convert   => { "[http][response][status_code]" => "integer" } }
+            }
+
+            # 군더더기 정리
+            mutate { remove_field => ["message","referrer_raw","col5","col6","col7","col8","col9","col10","status_code"] }
+          }
+
+    - name: 30-output-es.conf (to ES, index={{ ls_index_prefix }}-%{+YYYY.MM.dd})
+      copy:
+        dest: "{{ ls_pipeline_dir }}/30-output-es.conf"
+        mode: "0644"
+        content: |
+          output {
+            elasticsearch {
+              hosts => ["{{ es_url }}"]
+              index => "{{ ls_index_prefix }}-%{+YYYY.MM.dd}"
+            }
+            stdout { codec => rubydebug { metadata => false } }
+          }
+
+    # ---- Config test & 서비스 반영 ----
+    - name: Test pipeline syntax
+      command: /usr/share/logstash/bin/logstash --path.settings /etc/logstash -t
+      register: ls_test
+      changed_when: false
+      failed_when: "ls_test.rc != 0"
+
+    - name: Enable & restart Logstash
+      systemd: { name: logstash, enabled: true, state: restarted, daemon_reload: yes }
+
+    - name: Wait for beats port {{ beats_listen_port }}
+      wait_for: { host: 127.0.0.1, port: "{{ beats_listen_port }}", delay: 2, timeout: 60 }
+
+

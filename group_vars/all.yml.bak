@@ -1,0 +1,33 @@
+ansible_python_interpreter: /usr/bin/python3
+ansible_become: true
+ansible_become_method: sudo
+# 랩 환경: 아래 줄을 추가하면 -K 없이 sudo 가능 (원치 않으면 빼도 됨)
+ansible_become_password: "wlals12z"
+
+system_timezone: Asia/Seoul
+elastic_version: "8.15.5"
+elastic_repo_key_url: "https://artifacts.elastic.co/GPG-KEY-elasticsearch"
+elastic_repo_line: "deb [signed-by=/usr/share/keyrings/elastic-archive-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main"
+
+# 토폴로지(프로젝트 고정)
+es_url: "http://192.168.1.50:9200"
+ls_host: "192.168.1.51"
+beats_listen_host: "0.0.0.0"
+beats_listen_port: 5044
+
+# 출력 인덱스 접두사 (Kibana Data View는 webapp2-*)
+ls_index_prefix: "webapp2"
+
+# WEB 로그 경로
+web_logs_glob: "/home/web/web/logging-control/logs/*.log"
+
+# 이미 고정 유지 중인 항목은 생략. 아래만 추가/수정
+app_name: logging-control
+app_base_dir: /home/web/web
+app_repo_url: "https://your.git.server/your-org/logging-control.git"   # ← 실제 Git URL로 변경
+app_dir: "{{ app_base_dir }}/{{ app_name }}"
+app_logs_dir: "{{ app_dir }}/logs"
+app_branch: "main"         # 필요시 수정
+java_pkg: openjdk-17-jdk   # Ubuntu 22.04에서 Spring Boot 기본 호환
+run_mode: "bootRun"        # "bootRun" 또는 "bootJar" 중 선택 (아래 설명 참조)
+

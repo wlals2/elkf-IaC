@@ -1,0 +1,58 @@
+---
+- name: Install & configure Filebeat on WEB
+  hosts: web
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Ensure keyrings dir exists
+      file: { path: /usr/share/keyrings, state: directory, mode: "0755" }
+
+    - name: Download Elastic GPG key
+      get_url: { url: "{{ elastic_repo_key_url }}", dest: /usr/share/keyrings/elastic-archive-keyring.asc, mode: "0644" }
+
+    - name: Dearmor → .gpg
+      command: >
+        gpg --dearmor -o /usr/share/keyrings/elastic-archive-keyring.gpg
+        /usr/share/keyrings/elastic-archive-keyring.asc
+      args: { creates: /usr/share/keyrings/elastic-archive-keyring.gpg }
+
+    - name: Write Elastic apt source
+      copy: { dest: /etc/apt/sources.list.d/elastic-8.x.list, mode: "0644", content: "{{ elastic_repo_line }}\n" }
+
+    - name: Apt update
+      apt: { update_cache: true }
+
+    - block:
+        - name: Try pinned Filebeat {{ elastic_version }}
+          apt: { name: "filebeat={{ elastic_version }}", state: present }
+      rescue:
+        - name: Install Filebeat latest (fallback)
+          apt: { name: filebeat, state: present }
+
+    # ---- 멀티라인 제거 + root 필드(app) 보장 + LS로 전송 ----
+    - name: Configure /etc/filebeat/filebeat.yml (single-line)
+      copy:
+        dest: /etc/filebeat/filebeat.yml
+        mode: "0644"
+        content: |
+          filebeat.inputs:
+            - type: filestream
+              id: logging-control
+              paths:
+                - "{{ web_logs_glob }}"
+              fields:
+                app: logging-control
+              fields_under_root: true
+          output.logstash:
+            hosts: ["{{ ls_host }}:{{ beats_listen_port }}"]
+          logging.level: info
+      notify: Restart filebeat
+
+    - name: Enable & start filebeat
+      systemd: { name: filebeat, enabled: true, state: started, daemon_reload: yes }
+
+  handlers:
+    - name: Restart filebeat
+      service: { name: filebeat, state: restarted }
+
